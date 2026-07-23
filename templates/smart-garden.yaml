@@ -1,0 +1,632 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Smart Garden Manager - Fully sandbox-compatible implementation'
+
+# ============================================
+# PARAMETER
+# ============================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: smart-garden
+    Description: Name of the environment for resource naming
+  
+  S3DataBucketName:
+    Type: String
+    Default: smart-garden-raw-data-x-bucket
+    Description: Unique S3 bucket smart-garden-raw-data-x-bucket for data archiving
+  
+  S3WebsiteBucketName:
+    Type: String
+    Default: smart-garden-dashboard-x-bucket
+    Description: Unique S3 bucket smart-garden-dashboard-x-bucket for website hosting
+  
+  EmailAddress:
+    Type: String
+    Default: yulong@hotmail.de
+    Description: E-Mail-Adresse for SNS notifications
+
+# ============================================
+# RESOURCES
+# ============================================
+Resources:
+
+  # ------------------------------------------------------------
+  # 1. S3 - DATA BUCKET (for archiving raw sensor data)
+  # ------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3DataBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldData
+            Status: Enabled
+            ExpirationInDays: 365
+            Prefix: raw-data/
+
+  # ------------------------------------------------------------
+  # 2. S3 - WEBSITE BUCKET (for website hosting)
+  # ------------------------------------------------------------
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3WebsiteBucketName
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  # ------------------------------------------------------------
+  # 3. S3 - WEBSITE BUCKET POLICY (public access)
+  # ------------------------------------------------------------
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+
+  # ------------------------------------------------------------
+  # 4. DYNAMODB - SENSOR DATA TABLE (history)
+  # ------------------------------------------------------------
+  SensorDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${EnvironmentName}-sensor-data'
+      AttributeDefinitions:
+        - AttributeName: sensor_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sensor_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # ------------------------------------------------------------
+  # 5. DYNAMODB - SENSOR LATEST TABLE (current values)
+  # ------------------------------------------------------------
+  SensorLatestTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${EnvironmentName}-sensor-latest'
+      AttributeDefinitions:
+        - AttributeName: sensor_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sensor_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # ------------------------------------------------------------
+  # 6. IoT CORE - THING
+  # ------------------------------------------------------------
+  IoTThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Sub '${EnvironmentName}-sensor'
+
+  # ------------------------------------------------------------
+  # 7. IoT CORE - POLICY
+  # ------------------------------------------------------------
+  IoTPolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${EnvironmentName}-iot-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+              - iot:Publish
+              - iot:Subscribe
+              - iot:Receive
+            Resource: '*'
+
+  # ------------------------------------------------------------
+  # 8. IoT CORE - TOPIC RULE (connects IoT with Lambda)
+  # ------------------------------------------------------------
+  IoTTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${EnvironmentName}-rule'
+      TopicRulePayload:
+        Sql: "SELECT * FROM 'sensor/data'"
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt ProcessDataFunction.Arn
+
+  # ------------------------------------------------------------
+  # 9. LAMBDA - DATA PROCESSOR (processes sensor data)
+  # ------------------------------------------------------------
+  ProcessDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-process-data'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          import uuid
+          
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          
+          # Tables from environment variables
+          table_latest = dynamodb.Table(os.environ['LATEST_TABLE'])
+          table_history = dynamodb.Table(os.environ['HISTORY_TABLE'])
+          data_bucket = os.environ['DATA_BUCKET']
+          sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+          
+          def lambda_handler(event, context):
+              """
+              Main function: Processes incoming IoT sensor data
+              """
+              try:
+                  # 1. Parse data (support different formats)
+                  if isinstance(event, dict) and 'body' in event:
+                      data = json.loads(event['body'])
+                  else:
+                      data = event
+                  
+                  # 2. Extract sensor data
+                  sensor_id = data.get('sensor_id', 'sensor-001')
+                  temperature = float(data.get('temperature', 0))
+                  humidity = float(data.get('humidity', 0))
+                  soil_moisture = float(data.get('soil_moisture', 0))
+                  timestamp = datetime.utcnow().isoformat() + 'Z'
+                  
+                  print(f"📊 Received: {sensor_id} - T:{temperature}°C H:{humidity}% M:{soil_moisture}%")
+                  
+                  # 3. Store current values ​​in DynamoDB
+                  latest_item = {
+                      'sensor_id': sensor_id,
+                      'temperature': temperature,
+                      'humidity': humidity,
+                      'soil_moisture': soil_moisture,
+                      'timestamp': timestamp,
+                      'last_updated': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+                  }
+                  table_latest.put_item(Item=latest_item)
+                  print(f"💾 Latest saved: {sensor_id}")
+                  
+                  # 4. Storing historical data in DynamoDB
+                  history_item = {
+                      'sensor_id': sensor_id,
+                      'timestamp': timestamp,
+                      'temperature': temperature,
+                      'humidity': humidity,
+                      'soil_moisture': soil_moisture,
+                      'record_id': str(uuid.uuid4())
+                  }
+                  table_history.put_item(Item=history_item)
+                  print(f"📚 History saved: {sensor_id}")
+                  
+                  # 5. Archive raw data in S3
+                  s3_key = f"raw-data/{sensor_id}/{timestamp.replace(':', '-').replace('Z', '')}.json"
+                  s3.put_object(
+                      Bucket=data_bucket,
+                      Key=s3_key,
+                      Body=json.dumps(data, indent=2),
+                      ContentType='application/json'
+                  )
+                  print(f"📦 Archived: {s3_key}")
+                  
+                  # 6. Check for alerts based on thresholds
+                  alerts = []
+                  
+                  # Soil moisture too low
+                  if soil_moisture < 30:
+                      alerts.append(f"⚠️ Low Soil Moisture: {soil_moisture}%")
+                  
+                  # Temperature too high
+                  if temperature > 35:
+                      alerts.append(f"⚠️ High Temperature: {temperature}°C")
+                  
+                  # Humidity too low
+                  if humidity < 40:
+                      alerts.append(f"⚠️ Low Humidity: {humidity}%")
+                  
+                  # Soil moisture too high
+                  if soil_moisture > 80:
+                      alerts.append(f"⚠️ High Soil Moisture: {soil_moisture}%")
+                  
+                  # 7. Send alerts via SNS if any
+                  if alerts:
+                      alert_message = f"""
+          🌱 SMART GARDEN ALERT
+          ====================
+          Sensor: {sensor_id}
+          Time: {timestamp}
+          
+          🚨 ALERTS:
+          {chr(10).join(alerts)}
+          
+          📊 Current Readings:
+          - Temperature: {temperature}°C
+          - Humidity: {humidity}%
+          - Soil Moisture: {soil_moisture}%
+          
+          ---
+          This is an automated message from your Smart Garden Manager.
+          """
+                      sns.publish(
+                          TopicArn=sns_topic_arn,
+                          Subject='🌱 Smart Garden Alert',
+                          Message=alert_message
+                      )
+                      print(f"🔔 Alert sent: {len(alerts)} warnings")
+                  
+                  # 8. Successful response
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Data processed successfully',
+                          'sensor_id': sensor_id,
+                          'alerts': alerts,
+                          'timestamp': timestamp
+                      })
+                  }
+                  
+              except ValueError as ve:
+                  print(f"❌ Value error: {str(ve)}")
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': f'Invalid data: {str(ve)}'})
+                  }
+              except Exception as e:
+                  print(f"❌ Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f'Internal error: {str(e)}'})
+                  }
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Environment:
+        Variables:
+          LATEST_TABLE: !Ref SensorLatestTable
+          HISTORY_TABLE: !Ref SensorDataTable
+          DATA_BUCKET: !Ref DataBucket
+          SNS_TOPIC_ARN: !Ref AlertTopic
+      Timeout: 30
+      MemorySize: 128
+
+  # ------------------------------------------------------------
+  # 10. LAMBDA PERMISSION – IoT is allowed to invoke Lambda
+  # ------------------------------------------------------------
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessDataFunction
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:rule/${EnvironmentName}-rule'
+
+  # ------------------------------------------------------------
+  # 11. LAMBDA - QUERY API (for dashboard)
+  # ------------------------------------------------------------
+  QueryDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-query-data'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from datetime import datetime, timedelta
+          import os
+          from decimal import Decimal
+          
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          
+          # Tables from environment variables
+          table_latest = dynamodb.Table(os.environ['LATEST_TABLE'])
+          table_history = dynamodb.Table(os.environ['HISTORY_TABLE'])
+          
+          class DecimalEncoder(json.JSONEncoder):
+              """Helper class for Decimal to JSON"""
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+          
+          def lambda_handler(event, context):
+              """
+              Main function: Responds to API requests for the dashboard.
+              """
+              try:
+                  # 1. Parse query parameters
+                  params = event.get('queryStringParameters', {}) or {}
+                  sensor_id = params.get('sensor_id', 'sensor-001')
+                  hours = int(params.get('hours', 24))
+                  limit = int(params.get('limit', 100))
+                  
+                  print(f"🔍 Query: sensor_id={sensor_id}, hours={hours}, limit={limit}")
+                  
+                  # 2. Get current values
+                  latest_response = table_latest.get_item(Key={'sensor_id': sensor_id})
+                  latest = latest_response.get('Item', {})
+                  
+                  # 3. Get historical data (last N hours)
+                  cutoff_time = (datetime.utcnow() - timedelta(hours=hours)).isoformat() + 'Z'
+                  
+                  history_response = table_history.query(
+                      KeyConditionExpression='sensor_id = :sid AND #ts >= :cutoff',
+                      ExpressionAttributeNames={
+                          '#ts': 'timestamp'
+                      },
+                      ExpressionAttributeValues={
+                          ':sid': sensor_id,
+                          ':cutoff': cutoff_time
+                      },
+                      ScanIndexForward=False,
+                      Limit=limit
+                  )
+                  
+                  history = history_response.get('Items', [])
+                  print(f"📚 History: {len(history)} entries")
+                  
+                  # 4. Calculate statistics
+                  stats = {}
+                  if history:
+                      temps = [float(item.get('temperature', 0)) for item in history]
+                      hums = [float(item.get('humidity', 0)) for item in history]
+                      soils = [float(item.get('soil_moisture', 0)) for item in history]
+                      
+                      stats = {
+                          'temperature': {
+                              'avg': round(sum(temps) / len(temps), 1),
+                              'min': round(min(temps), 1),
+                              'max': round(max(temps), 1)
+                          },
+                          'humidity': {
+                              'avg': round(sum(hums) / len(hums), 1),
+                              'min': round(min(hums), 1),
+                              'max': round(max(hums), 1)
+                          },
+                          'soil_moisture': {
+                              'avg': round(sum(soils) / len(soils), 1),
+                              'min': round(min(soils), 1),
+                              'max': round(max(soils), 1)
+                          }
+                      }
+                      print(f"📈 Statistics: {stats}")
+                  
+                  # 5. Create response
+                  response_body = {
+                      'latest': latest,
+                      'history': history,
+                      'stats': stats,
+                      'count': len(history),
+                      'sensor_id': sensor_id,
+                      'time_range': f'Last {hours} hours',
+                      'timestamp': datetime.utcnow().isoformat() + 'Z'
+                  }
+                  
+                  # 6. Create successful response with CORS headers
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': json.dumps(response_body, cls=DecimalEncoder)
+                  }
+                  
+              except ValueError as ve:
+                  print(f"❌ Value error: {str(ve)}")
+                  return {
+                      'statusCode': 400,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': f'Invalid parameter: {str(ve)}'})
+                  }
+              except Exception as e:
+                  print(f"❌ Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({'error': f'Internal error: {str(e)}'})
+                  }
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Environment:
+        Variables:
+          LATEST_TABLE: !Ref SensorLatestTable
+          HISTORY_TABLE: !Ref SensorDataTable
+      Timeout: 30
+      MemorySize: 128
+
+  # ---------------------------------------------------------------
+  # 12. LAMBDA PERMISSION - API Gateway is allowed to invoke Lambda
+  # ---------------------------------------------------------------
+  QueryLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QueryDataFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SensorAPI}/*/*/data'
+
+  # ------------------------------------------------------------
+  # 13. SNS - ALERT TOPIC
+  # ------------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-alerts'
+
+  # ------------------------------------------------------------
+  # 14. SNS - EMAIL SUBSCRIPTION
+  # ------------------------------------------------------------
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref AlertTopic
+      Endpoint: !Ref EmailAddress
+
+  # ------------------------------------------------------------
+  # 15. API GATEWAY - REST API
+  # ------------------------------------------------------------
+  SensorAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${EnvironmentName}-api'
+      Description: API for Smart Garden Manager
+
+  # ------------------------------------------------------------
+  # 16. API GATEWAY - RESOURCE (/data)
+  # ------------------------------------------------------------
+  SensorAPIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SensorAPI
+      ParentId: !GetAtt SensorAPI.RootResourceId
+      PathPart: data
+
+  # ------------------------------------------------------------
+  # 17. API GATEWAY - GET METHOD
+  # ------------------------------------------------------------
+  SensorAPIGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SensorAPI
+      ResourceId: !Ref SensorAPIResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryDataFunction.Arn}/invocations'
+
+  # ------------------------------------------------------------
+  # 18. API GATEWAY - POST METHOD
+  # ------------------------------------------------------------
+  SensorAPIPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SensorAPI
+      ResourceId: !Ref SensorAPIResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProcessDataFunction.Arn}/invocations'
+
+  # ------------------------------------------------------------
+  # 19. API GATEWAY - DEPLOYMENT
+  # ------------------------------------------------------------
+  SensorAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SensorAPIGetMethod
+      - SensorAPIPostMethod
+    Properties:
+      RestApiId: !Ref SensorAPI
+      StageName: prod
+
+  # ------------------------------------------------------------
+  # 20. CLOUDFRONT - DISTRIBUTION
+  # ------------------------------------------------------------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          DefaultTTL: 3600
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # ------------------------------------------------------------
+  # 21. CLOUDWATCH - LAMBDA ERROR ALARM
+  # ------------------------------------------------------------
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-lambda-errors'
+      AlarmDescription: Alarm is triggered when Lambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessDataFunction
+
+# ============================================
+# OUTPUTS
+# ============================================
+Outputs:
+  WebsiteURL:
+    Description: URL for the web dashboard
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  
+  APIGatewayURL:
+    Description: API Gateway endpoint for data querying
+    Value: !Sub 'https://${SensorAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/data'
+  
+  IoTTopic:
+    Description: IoT topic for sending sensor data
+    Value: 'sensor/data'
+  
+  IoTThingName:
+    Description: Name of the IoT Thing for the connection
+    Value: !Ref IoTThing
+  
+  S3DataBucket:
+    Description: S3 Bucket for data archiving
+    Value: !Ref DataBucket
+  
+  S3WebsiteBucket:
+    Description: S3 Bucket for website hosting
+    Value: !Ref WebsiteBucket

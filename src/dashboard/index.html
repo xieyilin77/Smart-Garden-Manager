@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>🌱 Smart Garden Manager</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <!-- ============================================ -->
+    <!-- HEADER -->
+    <!-- ============================================ -->
+    <header>
+        <div class="header-content">
+            <div class="header-left">
+                <h1>🌱 Smart Garden Manager</h1>
+                <span class="subtitle">Serverless IoT Monitoring</span>
+            </div>
+            <div class="header-right">
+                <span class="last-update" id="lastUpdate">🔄 Letztes Update: --</span>
+                <button class="refresh-btn" onclick="refreshData()">
+                    🔄 Aktualisieren
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- ============================================ -->
+    <!-- MAIN CONTENT -->
+    <!-- ============================================ -->
+    <main>
+        <!-- Aktuelle Werte -->
+        <section class="section current-values">
+            <h2>📊 Aktuelle Sensorwerte</h2>
+            <div class="value-grid">
+                <div class="value-card temp">
+                    <div class="card-icon">🌡️</div>
+                    <div class="card-details">
+                        <span class="card-label">Temperatur</span>
+                        <span class="card-value" id="currentTemp">--°C</span>
+                    </div>
+                </div>
+                <div class="value-card humidity">
+                    <div class="card-icon">💧</div>
+                    <div class="card-details">
+                        <span class="card-label">Luftfeuchtigkeit</span>
+                        <span class="card-value" id="currentHumidity">--%</span>
+                    </div>
+                </div>
+                <div class="value-card moisture">
+                    <div class="card-icon">🌿</div>
+                    <div class="card-details">
+                        <span class="card-label">Bodenfeuchte</span>
+                        <span class="card-value" id="currentMoisture">--%</span>
+                    </div>
+                </div>
+                <div class="value-card status">
+                    <div class="card-icon">📡</div>
+                    <div class="card-details">
+                        <span class="card-label">Sensor Status</span>
+                        <span class="card-value" id="sensorStatus">---</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Diagramme -->
+        <section class="section charts-section">
+            <h2>📈 Historische Daten</h2>
+            <div class="chart-controls">
+                <label for="timeRange">Zeitraum:</label>
+                <select id="timeRange" onchange="loadData()">
+                    <option value="1">Letzte Stunde</option>
+                    <option value="6">Letzte 6 Stunden</option>
+                    <option value="24" selected>Letzte 24 Stunden</option>
+                    <option value="168">Letzte 7 Tage</option>
+                    <option value="720">Letzte 30 Tage</option>
+                </select>
+                <span class="data-points" id="dataPoints">0 Datenpunkte</span>
+            </div>
+            <div class="chart-grid">
+                <div class="chart-container">
+                    <h3>Temperatur</h3>
+                    <canvas id="tempChart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Luftfeuchtigkeit</h3>
+                    <canvas id="humidityChart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Bodenfeuchte</h3>
+                    <canvas id="moistureChart"></canvas>
+                </div>
+            </div>
+        </section>
+
+        <!-- Statistiken -->
+        <section class="section stats-section">
+            <h2>📊 Statistiken</h2>
+            <div class="stats-grid" id="statsGrid">
+                <div class="stat-item">
+                    <span class="stat-label">Ø Temperatur</span>
+                    <span class="stat-value" id="avgTemp">--°C</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Ø Luftfeuchtigkeit</span>
+                    <span class="stat-value" id="avgHumidity">--%</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Ø Bodenfeuchte</span>
+                    <span class="stat-value" id="avgMoisture">--%</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Min. Temperatur</span>
+                    <span class="stat-value" id="minTemp">--°C</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Max. Temperatur</span>
+                    <span class="stat-value" id="maxTemp">--°C</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Datenpunkte</span>
+                    <span class="stat-value" id="dataPointCount">0</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Rohdaten-Tabelle -->
+        <section class="section raw-data-section">
+            <h2>📋 Letzte Messungen</h2>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Zeitpunkt</th>
+                            <th>Temperatur (°C)</th>
+                            <th>Luftfeuchtigkeit (%)</th>
+                            <th>Bodenfeuchte (%)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="dataTableBody">
+                        <tr>
+                            <td colspan="4" class="loading-text">Lade Daten...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <!-- ============================================ -->
+    <!-- FOOTER -->
+    <!-- ============================================ -->
+    <footer>
+        <p>🌱 Smart Garden Manager &copy; 2024 - Serverless IoT Solution</p>
+        <p class="footer-tech">Powered by AWS Lambda, DynamoDB, IoT Core</p>
+    </footer>
+
+    <script src="dashboard.js"></script>
+</body>
+</html>
